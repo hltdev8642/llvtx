@@ -190,6 +190,56 @@ function setDownloadMeta(api, dlId, modName, version) {
   }
 }
 
+/**
+ * Set mod attributes required for Vortex's native version dropdown grouping.
+ *
+ * Vortex groups mods via modGrouping.ts → byFile → fileMatch, which compares
+ * logicalFileName (with version stripped out). Setting the same logicalFileName
+ * on all versions of a LoversLab mod ensures they appear together in the
+ * version dropdown, enabling one-click switching between versions.
+ */
+function applyVersionGrouping(api, installedModId, modName, version) {
+  if (!installedModId) return;
+  try {
+    if (modName) {
+      api.store.dispatch({
+        type: 'SET_MOD_ATTRIBUTE',
+        payload: { gameId: GAME_ID, modId: installedModId, attribute: 'logicalFileName', value: modName },
+      });
+    }
+    if (version) {
+      api.store.dispatch({
+        type: 'SET_MOD_ATTRIBUTE',
+        payload: { gameId: GAME_ID, modId: installedModId, attribute: 'version', value: version },
+      });
+    }
+    api.store.dispatch({
+      type: 'SET_MOD_ATTRIBUTE',
+      payload: { gameId: GAME_ID, modId: installedModId, attribute: 'source', value: 'loverslab' },
+    });
+    debugLog('Applied version grouping attributes', { installedModId, modName, version });
+  } catch (err) {
+    debugLog('Failed to apply version grouping (non-critical)', { error: err.message });
+  }
+}
+
+/**
+ * Find a mod id by its display name (best-effort match).
+ * Returns undefined when not found.
+ */
+function findModIdByName(api, modName) {
+  try {
+    if (!modName) return undefined;
+    const state = api.getState();
+    const mods = util.getSafe(state, ['persistent', 'mods', GAME_ID], {});
+    const found = Object.values(mods).find((m) => (m.attributes?.name || '').toLowerCase() === String(modName).toLowerCase());
+    return found ? found.id : undefined;
+  } catch (e) {
+    debugLog('findModIdByName failed', { error: e.message });
+    return undefined;
+  }
+}
+
 // ─── Install ─────────────────────────────────────────────────────────────────
 
 /**
@@ -208,11 +258,12 @@ async function installFile(api, filePath, modName, version) {
       const dlId = dlIds[0];
       setDownloadMeta(api, dlId, modName, version);
 
-      api.events.emit('start-install-download', dlId, undefined, (err, installedModId) => {
+      api.events.emit('start-install-download', dlId, true, (err, installedModId) => {
         if (err) {
           errorLog('installFile: install step failed', { dlId, error: err.message });
           return reject(err);
         }
+        applyVersionGrouping(api, installedModId, modName, version);
         resolve(installedModId || dlId);
       });
     });
@@ -250,7 +301,7 @@ async function installLocalFileUpdate(api, mod, filePath, latestVersion) {
       setDownloadMeta(api, dlId, modName, latestVersion || previousVersion);
 
       // Step 3: Trigger Vortex's native mod installation
-      api.events.emit('start-install-download', dlId, undefined, (err, installedModId) => {
+      api.events.emit('start-install-download', dlId, true, (err, installedModId) => {
         if (err) {
           errorLog('Vortex install-from-download failed', { dlId, error: err.message });
           return reject(new Error(`Installation failed: ${err.message}`));
@@ -262,6 +313,36 @@ async function installLocalFileUpdate(api, mod, filePath, latestVersion) {
           previousVersion,
           latestVersion,
         });
+
+        // Apply version grouping to the newly installed mod so it appears
+        // in the same version dropdown as the existing version
+        applyVersionGrouping(api, installedModId, modName, latestVersion || previousVersion);
+
+        // Ensure the existing (old) mod also has logicalFileName so the
+        // grouping engine (modGrouping.ts → byFile) links them together
+        if (modId && modId !== installedModId) {
+          try {
+            api.store.dispatch({
+              type: 'SET_MOD_ATTRIBUTE',
+              payload: { gameId: GAME_ID, modId, attribute: 'logicalFileName', value: modName },
+            });
+          } catch (_e) { /* non-critical */ }
+        }
+
+        // Record previous version in mod attributes so the extension can
+        // present a per-mod version history dropdown if needed.
+        try {
+          const existingHistory = Array.isArray(mod.attributes?.llPreviousVersions)
+            ? mod.attributes.llPreviousVersions
+            : [];
+          const nextHistory = [...new Set([...existingHistory, String(previousVersion)])].slice(-20);
+          api.store.dispatch({
+            type: 'SET_MOD_ATTRIBUTE',
+            payload: { gameId: GAME_ID, modId, attribute: 'llPreviousVersions', value: nextHistory },
+          });
+        } catch (e) {
+          debugLog('Failed to record llPreviousVersions (non-critical)', { error: e.message });
+        }
 
         api.sendNotification({
           id: `llmm-local-install-${modId}`,
@@ -288,7 +369,7 @@ async function installLocalFileUpdate(api, mod, filePath, latestVersion) {
  * Waits briefly for Vortex's built-in file watcher to register the download,
  * then falls back to manual registration via ADD_LOCAL_DOWNLOAD.
  */
-async function installAlreadyDownloaded(api, filePath, modName, latestVersion) {
+async function installAlreadyDownloaded(api, filePath, modName, latestVersion, knownModId) {
   const fileName = path.basename(filePath);
   debugLog('Installing file already in download directory', { fileName, modName, latestVersion });
 
@@ -316,13 +397,44 @@ async function installAlreadyDownloaded(api, filePath, modName, latestVersion) {
   setDownloadMeta(api, dlId, modName, latestVersion);
 
   return new Promise((resolve, reject) => {
-    api.events.emit('start-install-download', dlId, undefined, (err, installedModId) => {
+    api.events.emit('start-install-download', dlId, true, (err, installedModId) => {
       if (err) {
         errorLog('Install failed for downloaded file', { dlId, error: err.message });
         return reject(new Error(`Installation failed: ${err.message}`));
       }
 
       infoLog('Downloaded file installed via Vortex', { installedModId, modName, latestVersion });
+
+      // Apply version grouping attributes for the version dropdown
+      applyVersionGrouping(api, installedModId, modName, latestVersion);
+
+      // Ensure the existing mod also has logicalFileName for grouping
+      if (knownModId && knownModId !== installedModId) {
+        try {
+          api.store.dispatch({
+            type: 'SET_MOD_ATTRIBUTE',
+            payload: { gameId: GAME_ID, modId: knownModId, attribute: 'logicalFileName', value: modName },
+          });
+        } catch (_e) { /* non-critical */ }
+      }
+
+      // Attempt to attach previous version metadata to the installed mod
+      try {
+        const state = api.getState();
+        const mods = util.getSafe(state, ['persistent', 'mods', GAME_ID], {});
+        const modEntry = Object.values(mods).find((m) => (m.attributes?.name || '') === modName);
+        if (modEntry) {
+          const modId = modEntry.id;
+          const existingHistory = Array.isArray(modEntry.attributes?.llPreviousVersions)
+            ? modEntry.attributes.llPreviousVersions
+            : [];
+          // We don't know the exact previous version here; preserve any existing history.
+          const nextHistory = existingHistory.slice(-20);
+          api.store.dispatch({ type: 'SET_MOD_ATTRIBUTE', payload: { gameId: GAME_ID, modId, attribute: 'llPreviousVersions', value: nextHistory } });
+        }
+      } catch (e) {
+        debugLog('Failed to set llPreviousVersions after install (non-critical)', { error: e.message });
+      }
 
       api.sendNotification({
         id: `llmm-dl-installed-${dlId}`,
@@ -403,7 +515,7 @@ function downloadViaBrowser(api, updateInfo) {
           });
 
           try {
-            const result = await installAlreadyDownloaded(api, filePath, modName, latestVersion);
+            const result = await installAlreadyDownloaded(api, filePath, modName, latestVersion, modId);
             resolve({ success: true, filePath, ...result });
           } catch (installErr) {
             errorLog('Install failed after download', { modId, error: installErr.message });
@@ -489,4 +601,5 @@ module.exports = {
   installLocalFileUpdate,
   installAlreadyDownloaded,
   monitorDirectory,
+  applyVersionGrouping,
 };

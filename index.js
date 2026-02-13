@@ -162,6 +162,20 @@ function main(context) {
     context.api.events.on('gamemode-activated', async (gameId) => {
       if (gameId !== GAME_ID) return;
       const state = context.api.getState();
+
+      // Ensure all LL-tagged mods have logicalFileName set for version
+      // dropdown grouping (modGrouping.ts → byFile → fileMatch).
+      const allMods = util.getSafe(state, ['persistent', 'mods', gameId], {});
+      Object.values(allMods).forEach((m) => {
+        const src = m.attributes?.source || '';
+        if (src.includes(LOVERSLAB_DOMAIN) && !m.attributes?.logicalFileName && m.attributes?.name) {
+          context.api.store.dispatch({
+            type: 'SET_MOD_ATTRIBUTE',
+            payload: { gameId, modId: m.id, attribute: 'logicalFileName', value: m.attributes.name },
+          });
+        }
+      });
+
       const settings = getSettings(state);
       if (settings.autoCheckOnActivate) {
         debugLog('Auto-checking for updates on activation');
@@ -391,6 +405,11 @@ function showSetSourceDialog(api, modId) {
         api.store.dispatch({
           type: 'SET_MOD_ATTRIBUTE',
           payload: { gameId, modId, attribute: 'source', value: parsedUrl.toString() },
+        });
+        // Set logicalFileName for version dropdown grouping
+        api.store.dispatch({
+          type: 'SET_MOD_ATTRIBUTE',
+          payload: { gameId, modId, attribute: 'logicalFileName', value: mod.attributes?.name || modId },
         });
         if (inputVersion.trim()) {
           api.store.dispatch({
@@ -679,6 +698,11 @@ function showDetectionDialog(api) {
       api.store.dispatch({
         type: 'SET_MOD_ATTRIBUTE',
         payload: { gameId: GAME_ID, modId, attribute: 'llDetected', value: true },
+      });
+      // Set logicalFileName for version dropdown grouping
+      api.store.dispatch({
+        type: 'SET_MOD_ATTRIBUTE',
+        payload: { gameId: GAME_ID, modId, attribute: 'logicalFileName', value: entry.mod.attributes?.name || modId },
       });
       imported++;
     });
