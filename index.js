@@ -139,6 +139,13 @@ function main(context) {
     },
   );
 
+  context.registerAction('mods-action-icons', 215, 'download', {},
+    'Download LL Update (Single)', (instanceIds) => {
+      if (!instanceIds.length) return;
+      downloadSingleModUpdateAction(context.api, instanceIds[0]);
+    },
+  );
+
   // Check dependencies
   context.registerAction('mods-action-icons', 220, 'dependencies', {},
     'Check LL Dependencies', (instanceIds) => {
@@ -193,6 +200,38 @@ function main(context) {
 
 // ─── Dialog Helpers ──────────────────────────────────────────────────────────
 
+function getDialogValue(result, key) {
+  const input = result?.input;
+  if (input && !Array.isArray(input) && Object.prototype.hasOwnProperty.call(input, key)) {
+    return input[key];
+  }
+  if (Array.isArray(input)) {
+    const found = input.find((entry) => entry?.id === key);
+    if (found) return found.value;
+  }
+
+  const checkboxes = result?.checkboxes;
+  if (checkboxes && !Array.isArray(checkboxes) && Object.prototype.hasOwnProperty.call(checkboxes, key)) {
+    return checkboxes[key];
+  }
+  if (Array.isArray(checkboxes)) {
+    const found = checkboxes.find((entry) => entry?.id === key);
+    if (found) return found.value;
+  }
+
+  if (result && !Array.isArray(result) && Object.prototype.hasOwnProperty.call(result, key)) {
+    return result[key];
+  }
+
+  return undefined;
+}
+
+function getDialogBool(result, key, fallback = false) {
+  const val = getDialogValue(result, key);
+  if (val === undefined || val === null) return fallback;
+  return !!val;
+}
+
 function showSetSourceDialog(api, modId) {
   const state = api.getState();
   const gameId = selectors.activeGameId(state);
@@ -226,16 +265,9 @@ function showSetSourceDialog(api, modId) {
       label: 'Save',
       default: true,
       action: (result) => {
-        const input = result?.input || {};
-
-        const rawUrl = (() => {
-          if (typeof input.url === 'string') return input.url;
-          if (Array.isArray(input)) {
-            const found = input.find((item) => item?.id === 'url');
-            if (typeof found?.value === 'string') return found.value;
-          }
-          return '';
-        })();
+        const rawUrl = typeof getDialogValue(result, 'url') === 'string'
+          ? getDialogValue(result, 'url')
+          : '';
 
         const normalizedRawUrl = rawUrl.trim();
         const candidateUrl = /^https?:\/\//i.test(normalizedRawUrl)
@@ -258,14 +290,9 @@ function showSetSourceDialog(api, modId) {
           return;
         }
 
-        const inputVersion = (() => {
-          if (typeof input.version === 'string') return input.version;
-          if (Array.isArray(input)) {
-            const found = input.find((item) => item?.id === 'version');
-            if (typeof found?.value === 'string') return found.value;
-          }
-          return '';
-        })();
+        const inputVersion = typeof getDialogValue(result, 'version') === 'string'
+          ? getDialogValue(result, 'version')
+          : '';
 
         api.store.dispatch({
           type: 'SET_MOD_ATTRIBUTE',
@@ -288,6 +315,75 @@ function showSetSourceDialog(api, modId) {
       },
     },
   ]);
+}
+
+async function downloadSingleModUpdateAction(api, modId) {
+  const state = api.getState();
+  const gameId = selectors.activeGameId(state);
+  if (gameId !== GAME_ID) return;
+
+  const mods = util.getSafe(state, ['persistent', 'mods', gameId], {});
+  const mod = mods[modId];
+  if (!mod) return;
+
+  const source = mod.attributes?.source || '';
+  if (!source.includes(LOVERSLAB_DOMAIN)) {
+    api.sendNotification({
+      id: 'llmm-no-source-download',
+      type: 'info',
+      title: 'No LoversLab Source',
+      message: 'This mod does not have a LoversLab source URL. Use "Set LL Source" first.',
+      displayMS: 5000,
+    });
+    return;
+  }
+
+  api.sendNotification({
+    id: `llmm-download-check-${modId}`,
+    type: 'activity',
+    title: 'Checking for Downloadable Update',
+    message: `Checking ${mod.attributes?.name || modId}...`,
+    noDismiss: true,
+  });
+
+  try {
+    const settings = getSettings(state);
+    const update = await checkSingleMod(api, mod, settings);
+    api.dismissNotification(`llmm-download-check-${modId}`);
+
+    if (!update) {
+      api.sendNotification({
+        id: `llmm-download-none-${modId}`,
+        type: 'info',
+        title: 'No Update Available',
+        message: `${mod.attributes?.name || modId} is already up to date.`,
+        displayMS: 4000,
+      });
+      return;
+    }
+
+    if (!update.downloadUrl) {
+      api.showDialog('question', 'Download Link Not Found', {
+        text: `An update was found for ${update.modName}, but no direct download link was detected. Open the mod page in your browser?`,
+        options: { wrap: true },
+      }, [
+        { label: 'Cancel' },
+        { label: 'Open in Browser', action: () => util.opn(update.modUrl).catch(() => {}) },
+      ]);
+      return;
+    }
+
+    await downloadUpdate(api, update);
+  } catch (err) {
+    api.dismissNotification(`llmm-download-check-${modId}`);
+    api.sendNotification({
+      id: `llmm-download-fail-${modId}`,
+      type: 'error',
+      title: 'Download Failed',
+      message: `Failed to download update for ${mod.attributes?.name || modId}: ${err.message}`,
+      displayMS: 6000,
+    });
+  }
 }
 
 async function checkSingleModAction(api, modId) {
@@ -440,6 +536,7 @@ async function showDependencyDialog(api, modId) {
 
 function showDetectionDialog(api) {
   const state = api.getState();
+  const settings = getSettings(state);
   const detected = detectLoversLabMods(state, { threshold: 30, includeTagged: false });
 
   if (detected.length === 0) {
@@ -453,15 +550,70 @@ function showDetectionDialog(api) {
     return;
   }
 
-  const lines = detected.map((d) => {
+  const importDetectedMods = (selectedDetected) => {
+    let imported = 0;
+    selectedDetected.forEach((entry) => {
+      const modId = entry.mod.id;
+      api.store.dispatch({
+        type: 'SET_MOD_ATTRIBUTE',
+        payload: { gameId: GAME_ID, modId, attribute: 'source', value: 'https://www.loverslab.com/' },
+      });
+      api.store.dispatch({
+        type: 'SET_MOD_ATTRIBUTE',
+        payload: { gameId: GAME_ID, modId, attribute: 'llDetected', value: true },
+      });
+      imported++;
+    });
+
+    api.sendNotification({
+      id: 'llmm-detect-imported',
+      type: 'success',
+      title: 'Detected Mods Imported',
+      message: `Imported ${imported} detected mod(s). Use "Set LL Source" to set exact page URLs where needed.`,
+      displayMS: 6000,
+    });
+  };
+
+  if (settings.autoImportDetectedMods) {
+    importDetectedMods(detected);
+    return;
+  }
+
+  const checkboxes = detected.map((d) => {
     const name = d.mod.attributes?.name || d.mod.id;
-    return `${name} (confidence: ${d.score}%)`;
+    return {
+      id: `detect_${d.mod.id}`,
+      text: `${name} (confidence: ${d.score}%)`,
+      value: true,
+    };
   });
 
-  api.showDialog('info', 'Detected Potential LoversLab Mods', {
-    text: `Found ${detected.length} mod(s) that may be from LoversLab:\n\n${lines.join('\n')}\n\nUse "Set LL Source" on each mod to tag it with the correct URL.`,
+  api.showDialog('question', 'Detected Potential LoversLab Mods', {
+    text: `Found ${detected.length} potential LoversLab mod(s). Select which ones to import.`,
+    checkboxes,
     options: { wrap: true },
-  }, [{ label: 'Close' }]);
+  }, [
+    { label: 'Cancel' },
+    {
+      label: 'Import Selected',
+      default: true,
+      action: (result) => {
+        const selected = detected.filter((d) => getDialogBool(result, `detect_${d.mod.id}`, false));
+        if (selected.length === 0) {
+          api.sendNotification({
+            id: 'llmm-detect-none-selected',
+            type: 'info',
+            title: 'No Mods Selected',
+            message: 'No detected mods were selected for import.',
+            displayMS: 4000,
+          });
+          return;
+        }
+
+        importDetectedMods(selected);
+      },
+    },
+  ]);
 }
 
 function showExportDialog(api) {
@@ -514,7 +666,8 @@ function showImportDialog(api) {
       label: 'Import',
       default: true,
       action: (result) => {
-        const filePath = (result.input || {}).filePath;
+        const filePathValue = getDialogValue(result, 'filePath');
+        const filePath = typeof filePathValue === 'string' ? filePathValue : '';
         if (!filePath) return;
         importFromJson(api, filePath).catch((err) => {
           api.sendNotification({

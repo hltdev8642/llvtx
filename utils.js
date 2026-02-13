@@ -34,6 +34,7 @@ const DEFAULT_SETTINGS = Object.freeze({
   autoCheckOnActivate: true,
   autoCheckOnDeploy: false,
   autoDownload: false,
+  autoImportDetectedMods: false,
   checkIntervalMinutes: 60,
   maxConcurrentChecks: 3,
   requestTimeoutMs: 30000,

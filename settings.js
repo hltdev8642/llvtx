@@ -59,6 +59,11 @@ function showSettingsDialog(api) {
           value: current.autoDownload,
         },
         {
+          id: 'autoImportDetectedMods',
+          text: 'Automatically import all detected LoversLab mods',
+          value: current.autoImportDetectedMods,
+        },
+        {
           id: 'showNotifications',
           text: 'Show progress notifications',
           value: current.showNotifications,
@@ -103,16 +108,52 @@ function showSettingsDialog(api) {
         label: 'Save',
         default: true,
         action: (result) => {
-          const input = result.input || {};
+          const readDialogValue = (res, key) => {
+            const sourceInput = res?.input;
+            if (sourceInput && !Array.isArray(sourceInput) && Object.prototype.hasOwnProperty.call(sourceInput, key)) {
+              return sourceInput[key];
+            }
+            if (Array.isArray(sourceInput)) {
+              const found = sourceInput.find((entry) => entry?.id === key);
+              if (found) return found.value;
+            }
+
+            const sourceCheckboxes = res?.checkboxes;
+            if (sourceCheckboxes && !Array.isArray(sourceCheckboxes) && Object.prototype.hasOwnProperty.call(sourceCheckboxes, key)) {
+              return sourceCheckboxes[key];
+            }
+            if (Array.isArray(sourceCheckboxes)) {
+              const found = sourceCheckboxes.find((entry) => entry?.id === key);
+              if (found) return found.value;
+            }
+
+            if (res && !Array.isArray(res) && Object.prototype.hasOwnProperty.call(res, key)) {
+              return res[key];
+            }
+            return undefined;
+          };
 
           // Boolean checkboxes
-          ['autoCheckOnActivate', 'autoCheckOnDeploy', 'autoDownload', 'showNotifications', 'backupBeforeUpdate'].forEach((key) => {
-            setSetting(api, key, !!input[key]);
+          [
+            'autoCheckOnActivate',
+            'autoCheckOnDeploy',
+            'autoDownload',
+            'autoImportDetectedMods',
+            'showNotifications',
+            'backupBeforeUpdate',
+          ].forEach((key) => {
+            const value = readDialogValue(result, key);
+            if (value === undefined) return;
+            const normalizedBool =
+              typeof value === 'string'
+                ? value.trim().toLowerCase() === 'true'
+                : !!value;
+            setSetting(api, key, normalizedBool);
           });
 
           // Numeric inputs
           ['checkIntervalMinutes', 'maxConcurrentChecks', 'requestTimeoutMs', 'maxRetries'].forEach((key) => {
-            const num = parseInt(input[key], 10);
+            const num = parseInt(readDialogValue(result, key), 10);
             if (!isNaN(num) && num > 0) {
               setSetting(api, key, num);
             }
