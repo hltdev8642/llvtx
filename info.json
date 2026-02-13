@@ -1,0 +1,7 @@
+{
+  "name": "LoversLab Mod Manager for Skyrim SE",
+  "author": "llvtx",
+  "version": "1.0.0",
+  "description": "Complete LoversLab mod management extension for Vortex — update checking, batch operations, version tracking, dependency detection, and export/import for Skyrim SE mods hosted on LoversLab.com.",
+  "game": "skyrimse"
+}
