@@ -3,6 +3,7 @@
  * version backup before update, and Vortex install-from-file integration.
  */
 const path = require('path');
+const nodeFs = require('fs');
 const { fs, util } = require('vortex-api');
 const {
   GAME_ID,
@@ -124,7 +125,7 @@ async function backupModVersion(api, modId, modName, currentVersion) {
     }
 
     const modInstallDir = path.join(installPath, modId);
-    if (!fs.existsSync(modInstallDir)) {
+    if (!nodeFs.existsSync(modInstallDir)) {
       debugLog('Mod directory not found; skipping backup', { modInstallDir });
       return null;
     }
@@ -133,7 +134,7 @@ async function backupModVersion(api, modId, modName, currentVersion) {
       util.getVortexPath('temp'),
       'llmm-backups',
     );
-    if (!fs.existsSync(backupRoot)) {
+    if (!nodeFs.existsSync(backupRoot)) {
       fs.mkdirSync(backupRoot, { recursive: true });
     }
 
@@ -170,21 +171,168 @@ async function copyDirRecursive(src, dest) {
   }
 }
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Tag a Vortex download entry with LoversLab-related metadata.
+ */
+function setDownloadMeta(api, dlId, modName, version) {
+  try {
+    if (modName) {
+      api.store.dispatch({ type: 'SET_DOWNLOAD_MODINFO', payload: { id: dlId, key: 'name', value: modName } });
+    }
+    if (version) {
+      api.store.dispatch({ type: 'SET_DOWNLOAD_MODINFO', payload: { id: dlId, key: 'version', value: version } });
+    }
+    api.store.dispatch({ type: 'SET_DOWNLOAD_MODINFO', payload: { id: dlId, key: 'source', value: 'loverslab' } });
+  } catch (err) {
+    debugLog('Could not set download metadata (non-critical)', { error: err.message });
+  }
+}
+
 // ─── Install ─────────────────────────────────────────────────────────────────
 
 /**
- * Install a downloaded mod file through Vortex's event system.
+ * Import a file into Vortex's download management and trigger installation.
+ * Uses import-downloads → start-install-download, the same pipeline Vortex
+ * uses natively for Nexus mods.
  */
 async function installFile(api, filePath, modName, version) {
-  const fileName = path.basename(filePath);
-  debugLog('Installing file', { filePath, modName, version });
+  debugLog('Installing file via Vortex pipeline', { filePath, modName, version });
 
   return new Promise((resolve, reject) => {
     api.events.emit('import-downloads', [filePath], (dlIds) => {
       if (!dlIds || dlIds.length === 0) {
         return reject(new Error('Vortex did not return a download ID'));
       }
-      resolve(dlIds[0]);
+      const dlId = dlIds[0];
+      setDownloadMeta(api, dlId, modName, version);
+
+      api.events.emit('start-install-download', dlId, undefined, (err, installedModId) => {
+        if (err) {
+          errorLog('installFile: install step failed', { dlId, error: err.message });
+          return reject(err);
+        }
+        resolve(installedModId || dlId);
+      });
+    });
+  });
+}
+
+/**
+ * Import a local archive as a Vortex download and install it through Vortex's
+ * native pipeline (import-downloads → start-install-download).
+ * This gives the user Vortex's standard "replace / keep both" dialog, and
+ * correctly populates the version dropdown.
+ */
+async function installLocalFileUpdate(api, mod, filePath, latestVersion) {
+  const modId = mod.id;
+  const modName = mod.attributes?.name || modId;
+  const previousVersion = mod.attributes?.version || 'unknown';
+
+  if (!filePath || !nodeFs.existsSync(filePath)) {
+    throw new Error('Selected update file does not exist');
+  }
+
+  infoLog('Importing local update via Vortex pipeline', { modId, modName, filePath, latestVersion });
+
+  return new Promise((resolve, reject) => {
+    // Step 1: Import the archive into Vortex's download management
+    api.events.emit('import-downloads', [filePath], (dlIds) => {
+      if (!dlIds || dlIds.length === 0) {
+        return reject(new Error('Vortex did not return a download ID after import'));
+      }
+
+      const dlId = dlIds[0];
+      debugLog('File imported to Vortex downloads', { dlId, filePath });
+
+      // Step 2: Tag the download with mod metadata
+      setDownloadMeta(api, dlId, modName, latestVersion || previousVersion);
+
+      // Step 3: Trigger Vortex's native mod installation
+      api.events.emit('start-install-download', dlId, undefined, (err, installedModId) => {
+        if (err) {
+          errorLog('Vortex install-from-download failed', { dlId, error: err.message });
+          return reject(new Error(`Installation failed: ${err.message}`));
+        }
+
+        infoLog('Local update installed via Vortex', {
+          installedModId: installedModId || modId,
+          modName,
+          previousVersion,
+          latestVersion,
+        });
+
+        api.sendNotification({
+          id: `llmm-local-install-${modId}`,
+          type: 'success',
+          title: 'Update Installed',
+          message: `${modName} updated to ${latestVersion || 'new version'}.`,
+          displayMS: 6000,
+        });
+
+        resolve({
+          modId: installedModId || modId,
+          modName,
+          previousVersion,
+          latestVersion,
+          filePath,
+        });
+      });
+    });
+  });
+}
+
+/**
+ * Install a file that is already present in Vortex's download directory.
+ * Waits briefly for Vortex's built-in file watcher to register the download,
+ * then falls back to manual registration via ADD_LOCAL_DOWNLOAD.
+ */
+async function installAlreadyDownloaded(api, filePath, modName, latestVersion) {
+  const fileName = path.basename(filePath);
+  debugLog('Installing file already in download directory', { fileName, modName, latestVersion });
+
+  // Give Vortex's built-in watcher time to register the download
+  await new Promise((r) => setTimeout(r, 2500));
+
+  const state = api.getState();
+  const downloads = util.getSafe(state, ['persistent', 'downloads', 'files'], {});
+  let dlId = Object.keys(downloads).find((id) => downloads[id].localPath === fileName);
+
+  if (!dlId) {
+    dlId = `llmm-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
+    try {
+      const stats = nodeFs.statSync(filePath);
+      api.store.dispatch({
+        type: 'ADD_LOCAL_DOWNLOAD',
+        payload: { id: dlId, game: GAME_ID, localPath: fileName, fileSize: stats.size },
+      });
+      debugLog('Manually registered download entry', { dlId, fileName });
+    } catch (err) {
+      throw new Error(`Failed to register download: ${err.message}`);
+    }
+  }
+
+  setDownloadMeta(api, dlId, modName, latestVersion);
+
+  return new Promise((resolve, reject) => {
+    api.events.emit('start-install-download', dlId, undefined, (err, installedModId) => {
+      if (err) {
+        errorLog('Install failed for downloaded file', { dlId, error: err.message });
+        return reject(new Error(`Installation failed: ${err.message}`));
+      }
+
+      infoLog('Downloaded file installed via Vortex', { installedModId, modName, latestVersion });
+
+      api.sendNotification({
+        id: `llmm-dl-installed-${dlId}`,
+        type: 'success',
+        title: 'Mod Installed',
+        message: `${modName} v${latestVersion || 'unknown'} installed successfully.`,
+        displayMS: 6000,
+      });
+
+      resolve({ modId: installedModId, modName, version: latestVersion, filePath });
     });
   });
 }
@@ -255,8 +403,8 @@ function downloadViaBrowser(api, updateInfo) {
           });
 
           try {
-            await installFile(api, filePath, modName, latestVersion);
-            resolve({ success: true, filePath, modId, modName, version: latestVersion });
+            const result = await installAlreadyDownloaded(api, filePath, modName, latestVersion);
+            resolve({ success: true, filePath, ...result });
           } catch (installErr) {
             errorLog('Install failed after download', { modId, error: installErr.message });
             reject(installErr);
@@ -338,5 +486,7 @@ module.exports = {
   getActiveDownloads,
   backupModVersion,
   installFile,
+  installLocalFileUpdate,
+  installAlreadyDownloaded,
   monitorDirectory,
 };

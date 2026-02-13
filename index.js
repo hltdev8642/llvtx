@@ -5,6 +5,7 @@
  * and context-menu entries. This is the single file Vortex loads.
  */
 const path = require('path');
+const nodeFs = require('fs');
 const { fs, util, selectors } = require('vortex-api');
 const {
   GAME_ID,
@@ -23,7 +24,7 @@ const { versionTrackingReducer } = require('./versionTracking');
 const { dependencyReducer, analyseDependencies } = require('./dependencies');
 const { settingsReducer, showSettingsDialog } = require('./settings');
 const { checkAllMods, checkSingleMod } = require('./updateChecker');
-const { downloadUpdate } = require('./downloader');
+const { downloadUpdate, installLocalFileUpdate } = require('./downloader');
 const { batchCheckUpdates, batchDownloadUpdates, cancelBatch } = require('./batchOps');
 const { detectLoversLabMods, getTaggedMods } = require('./modDetection');
 const { exportToJson, exportToHtml, importFromJson } = require('./exportImport');
@@ -232,6 +233,99 @@ function getDialogBool(result, key, fallback = false) {
   return !!val;
 }
 
+async function promptLocalUpdateFile(api, update) {
+  const trySelectFileApi = async () => {
+    if (typeof api.selectFile !== 'function') return null;
+    const selected = await api.selectFile({
+      title: `Select update archive for ${update.modName}`,
+      defaultPath: api.getPath('download'),
+      filters: [
+        { name: 'Archives', extensions: ['7z', 'zip', 'rar'] },
+        { name: 'All files', extensions: ['*'] },
+      ],
+      properties: ['openFile'],
+    });
+
+    if (!selected) return null;
+    if (typeof selected === 'string') return selected;
+    if (Array.isArray(selected) && selected.length > 0) return selected[0];
+    if (selected.filePath) return selected.filePath;
+    if (Array.isArray(selected.filePaths) && selected.filePaths.length > 0) return selected.filePaths[0];
+    return null;
+  };
+
+  try {
+    const chosenByApi = await trySelectFileApi();
+    if (chosenByApi) return chosenByApi;
+  } catch {
+  }
+
+  return new Promise((resolve) => {
+    api.showDialog('question', 'Select Local Update File', {
+      text: `Select the downloaded archive for ${update.modName} (7z/zip/rar).`,
+      input: [
+        {
+          id: 'filePath',
+          type: 'text',
+          label: 'Archive Path',
+          placeholder: 'C:\\path\\to\\mod-update.7z',
+          value: '',
+        },
+      ],
+      options: { wrap: true },
+    }, [
+      { label: 'Cancel', action: () => resolve(null) },
+      {
+        label: 'Import & Install',
+        default: true,
+        action: (result) => {
+          const raw = getDialogValue(result, 'filePath');
+          const filePath = typeof raw === 'string' ? raw.trim() : '';
+          resolve(filePath || null);
+        },
+      },
+    ]);
+  });
+}
+
+async function manualImportUpdateFallback(api, mod, update, reasonText) {
+  api.showDialog('question', 'Manual Update Import', {
+    text: `${reasonText}\n\nYou can select a local archive file to import and install this update now.`,
+    options: { wrap: true },
+  }, [
+    { label: 'Cancel' },
+    {
+      label: 'Select File',
+      default: true,
+      action: async () => {
+        try {
+          const filePath = await promptLocalUpdateFile(api, update);
+          if (!filePath) return;
+          if (!nodeFs.existsSync(filePath)) {
+            api.sendNotification({
+              id: `llmm-manual-file-missing-${mod.id}`,
+              type: 'error',
+              title: 'File Not Found',
+              message: 'Selected file does not exist.',
+              displayMS: 5000,
+            });
+            return;
+          }
+          await installLocalFileUpdate(api, mod, filePath, update.latestVersion);
+        } catch (err) {
+          api.sendNotification({
+            id: `llmm-manual-import-fail-${mod.id}`,
+            type: 'error',
+            title: 'Manual Import Failed',
+            message: err.message,
+            displayMS: 6000,
+          });
+        }
+      },
+    },
+  ]);
+}
+
 function showSetSourceDialog(api, modId) {
   const state = api.getState();
   const gameId = selectors.activeGameId(state);
@@ -363,17 +457,25 @@ async function downloadSingleModUpdateAction(api, modId) {
     }
 
     if (!update.downloadUrl) {
-      api.showDialog('question', 'Download Link Not Found', {
-        text: `An update was found for ${update.modName}, but no direct download link was detected. Open the mod page in your browser?`,
-        options: { wrap: true },
-      }, [
-        { label: 'Cancel' },
-        { label: 'Open in Browser', action: () => util.opn(update.modUrl).catch(() => {}) },
-      ]);
+      manualImportUpdateFallback(
+        api,
+        mod,
+        update,
+        `An update was found for ${update.modName}, but no direct download link was detected.`,
+      );
       return;
     }
 
-    await downloadUpdate(api, update);
+    try {
+      await downloadUpdate(api, update);
+    } catch (downloadErr) {
+      manualImportUpdateFallback(
+        api,
+        mod,
+        update,
+        `Automatic download failed: ${downloadErr.message}`,
+      );
+    }
   } catch (err) {
     api.dismissNotification(`llmm-download-check-${modId}`);
     api.sendNotification({
@@ -427,8 +529,24 @@ async function checkSingleModAction(api, modId) {
         { label: 'Close' },
         update.downloadUrl ? {
           label: 'Download Update',
-          action: () => downloadUpdate(api, update).catch(() => {}),
+          action: () => downloadUpdate(api, update).catch((err) => manualImportUpdateFallback(
+            api,
+            mod,
+            update,
+            `Automatic download failed: ${err.message}`,
+          )),
         } : null,
+        {
+          label: 'Select Local File',
+          action: () => manualImportUpdateFallback(
+            api,
+            mod,
+            update,
+            update.downloadUrl
+              ? 'Use a local archive file instead of direct download.'
+              : 'No direct download link was found for this update.',
+          ),
+        },
         {
           label: 'Open in Browser',
           action: () => util.opn(update.modUrl).catch(() => {}),
