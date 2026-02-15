@@ -16,6 +16,7 @@ const {
   errorLog,
   normalizeVersion,
   compareVersions,
+  normalizeModName,
   getSettings,
 } = require('./utils');
 
@@ -169,10 +170,12 @@ function main(context) {
       Object.values(allMods).forEach((m) => {
         const src = m.attributes?.source || '';
         if (src.includes(LOVERSLAB_DOMAIN)) {
+          // Set NORMALIZED logicalFileName for consistent grouping
           if (!m.attributes?.logicalFileName && m.attributes?.name) {
+            const normalizedName = normalizeModName(m.attributes.name);
             context.api.store.dispatch({
               type: 'SET_MOD_ATTRIBUTE',
-              payload: { gameId, modId: m.id, attribute: 'logicalFileName', value: m.attributes.name },
+              payload: { gameId, modId: m.id, attribute: 'logicalFileName', value: normalizedName },
             });
           }
           // Extract and set modId from source URL if not already set
@@ -419,10 +422,12 @@ function showSetSourceDialog(api, modId) {
           type: 'SET_MOD_ATTRIBUTE',
           payload: { gameId, modId, attribute: 'source', value: urlString },
         });
-        // Set logicalFileName for version dropdown grouping
+        // Set NORMALIZED logicalFileName for version dropdown grouping
+        const modName = mod.attributes?.name || modId;
+        const normalizedName = normalizeModName(modName);
         api.store.dispatch({
           type: 'SET_MOD_ATTRIBUTE',
-          payload: { gameId, modId, attribute: 'logicalFileName', value: mod.attributes?.name || modId },
+          payload: { gameId, modId, attribute: 'logicalFileName', value: normalizedName },
         });
         // Extract and set modId from URL for modId-based grouping
         const match = urlString.match(/\/files\/file\/(\d+)/);

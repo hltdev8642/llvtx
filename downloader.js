@@ -13,6 +13,7 @@ const {
   errorLog,
   getSettings,
   sanitizeFileName,
+  normalizeModName,
 } = require('./utils');
 
 // ─── Global State ────────────────────────────────────────────────────────────
@@ -196,10 +197,12 @@ function extractLoversLabModId(sourceUrl) {
  */
 function setDownloadMeta(api, dlId, modName, version, sourceUrl) {
   try {
+    const normalizedName = normalizeModName(modName);
     if (modName) {
       api.store.dispatch({ type: 'SET_DOWNLOAD_MODINFO', payload: { id: dlId, key: 'name', value: modName } });
-      // Set logicalFileName in download metadata so attributeExtractor uses it during install
-      api.store.dispatch({ type: 'SET_DOWNLOAD_MODINFO', payload: { id: dlId, key: 'meta', value: { logicalFileName: modName } } });
+      // Set NORMALIZED logicalFileName in download metadata so attributeExtractor uses it during install
+      // This ensures version grouping works by matching base names without version numbers
+      api.store.dispatch({ type: 'SET_DOWNLOAD_MODINFO', payload: { id: dlId, key: 'meta', value: { logicalFileName: normalizedName } } });
     }
     if (version) {
       api.store.dispatch({ type: 'SET_DOWNLOAD_MODINFO', payload: { id: dlId, key: 'version', value: version } });
@@ -210,7 +213,7 @@ function setDownloadMeta(api, dlId, modName, version, sourceUrl) {
       api.store.dispatch({ type: 'SET_DOWNLOAD_MODINFO', payload: { id: dlId, key: 'ids', value: { modId: llModId } } });
     }
     api.store.dispatch({ type: 'SET_DOWNLOAD_MODINFO', payload: { id: dlId, key: 'source', value: 'loverslab' } });
-    debugLog('Set download metadata', { dlId, modName, version, llModId });
+    debugLog('Set download metadata for grouping', { dlId, originalName: modName, normalizedName, version, llModId, sourceUrl: sourceUrl ? 'set' : 'null' });
   } catch (err) {
     debugLog('Could not set download metadata (non-critical)', { error: err.message });
   }
@@ -227,7 +230,9 @@ function applyVersionGrouping(api, installedModId, modName, version, sourceUrl) 
     const state = api.getState();
     const mods = util.getSafe(state, ['persistent', 'mods', GAME_ID], {});
     const mod = mods[installedModId];
-    const needsLogicalFileName = modName && (!mod?.attributes?.logicalFileName || mod.attributes.logicalFileName !== modName);
+    const normalizedName = normalizeModName(modName);
+    const currentLogicalFileName = mod?.attributes?.logicalFileName;
+    const needsLogicalFileName = normalizedName && (!currentLogicalFileName || currentLogicalFileName !== normalizedName);
     const needsVersion = version && (!mod?.attributes?.version || mod.attributes.version !== version);
     const llModId = extractLoversLabModId(sourceUrl);
     const needsModId = llModId && (!mod?.attributes?.modId || mod.attributes.modId !== llModId);
@@ -235,7 +240,7 @@ function applyVersionGrouping(api, installedModId, modName, version, sourceUrl) 
     if (needsLogicalFileName) {
       api.store.dispatch({
         type: 'SET_MOD_ATTRIBUTE',
-        payload: { gameId: GAME_ID, modId: installedModId, attribute: 'logicalFileName', value: modName },
+        payload: { gameId: GAME_ID, modId: installedModId, attribute: 'logicalFileName', value: normalizedName },
       });
     }
     if (needsVersion) {
@@ -256,7 +261,18 @@ function applyVersionGrouping(api, installedModId, modName, version, sourceUrl) 
         payload: { gameId: GAME_ID, modId: installedModId, attribute: 'source', value: 'loverslab' },
       });
     }
-    debugLog('Applied version grouping attributes', { installedModId, modName, version, llModId, needsLogicalFileName, needsVersion, needsModId });
+    debugLog('Applied version grouping attributes', { 
+      installedModId, 
+      originalName: modName,
+      normalizedName, 
+      version, 
+      llModId, 
+      sourceUrl: sourceUrl ? 'set' : 'null',
+      currentLogicalFileName,
+      needsLogicalFileName, 
+      needsVersion, 
+      needsModId 
+    });
   } catch (err) {
     debugLog('Failed to apply version grouping (non-critical)', { error: err.message });
   }
@@ -358,9 +374,18 @@ async function installLocalFileUpdate(api, mod, filePath, latestVersion) {
         // Apply version grouping attributes (backup/enhancement)
         applyVersionGrouping(api, installedModId, modName, latestVersion || previousVersion, sourceUrl);
 
-        // Ensure the existing (old) mod also has grouping attributes
+        // CRITICAL: Ensure the existing (old) mod also has MATCHING grouping attributes
+        // Both versions must have identical logicalFileName and modId for Vortex grouping to work
         if (modId && modId !== installedModId) {
           applyVersionGrouping(api, modId, modName, previousVersion, sourceUrl);
+          debugLog('Version grouping applied to both old and new mod', {
+            oldModId: modId,
+            newModId: installedModId,
+            normalizedName: normalizeModName(modName),
+            oldVersion: previousVersion,
+            newVersion: latestVersion,
+            sourceUrl: sourceUrl ? 'available' : 'missing'
+          });
         }
 
         // Record previous version in mod attributes so the extension can

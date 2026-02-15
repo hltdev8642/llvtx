@@ -236,6 +236,31 @@ function sanitizeFileName(name) {
 }
 
 /**
+ * Normalize mod name for consistent version grouping.
+ * Strips version numbers, file extensions, and common suffixes.
+ * Vortex's fileMatch() does similar normalization when comparing logicalFileName.
+ */
+function normalizeModName(name) {
+  if (!name || typeof name !== 'string') return name;
+  let normalized = name;
+  
+  // Strip common file extensions
+  normalized = normalized.replace(/\.(7z|zip|rar)$/i, '');
+  
+  // Strip version patterns like: v1.2.3, 1.2.3, (1.2.3), [1.2.3], -1.2.3
+  normalized = normalized.replace(/[\s_-]*[v]?\d+\.\d+(?:\.\d+)?[a-z]?/gi, '');
+  normalized = normalized.replace(/[\[(]\d+\.\d+(?:\.\d+)?[a-z]?[\])]/gi, '');
+  
+  // Strip common suffixes
+  normalized = normalized.replace(/[\s_-]*(SE|SSE|AE|LE|SKSE|Special Edition|Anniversary Edition)$/i, '');
+  
+  // Clean up multiple spaces/dashes and trim
+  normalized = normalized.replace(/[\s_-]+/g, ' ').trim();
+  
+  return normalized;
+}
+
+/**
  * Get the Vortex settings for this extension, falling back to defaults.
  */
 function getSettings(state) {
@@ -265,5 +290,6 @@ module.exports = {
   sleep,
   levenshtein,
   sanitizeFileName,
+  normalizeModName,
   getSettings,
 };
