@@ -163,16 +163,28 @@ function main(context) {
       if (gameId !== GAME_ID) return;
       const state = context.api.getState();
 
-      // Ensure all LL-tagged mods have logicalFileName set for version
-      // dropdown grouping (modGrouping.ts → byFile → fileMatch).
+      // Ensure all LL-tagged mods have logicalFileName and modId set for version
+      // dropdown grouping. Vortex groups by modId first, then by logicalFileName.
       const allMods = util.getSafe(state, ['persistent', 'mods', gameId], {});
       Object.values(allMods).forEach((m) => {
         const src = m.attributes?.source || '';
-        if (src.includes(LOVERSLAB_DOMAIN) && !m.attributes?.logicalFileName && m.attributes?.name) {
-          context.api.store.dispatch({
-            type: 'SET_MOD_ATTRIBUTE',
-            payload: { gameId, modId: m.id, attribute: 'logicalFileName', value: m.attributes.name },
-          });
+        if (src.includes(LOVERSLAB_DOMAIN)) {
+          if (!m.attributes?.logicalFileName && m.attributes?.name) {
+            context.api.store.dispatch({
+              type: 'SET_MOD_ATTRIBUTE',
+              payload: { gameId, modId: m.id, attribute: 'logicalFileName', value: m.attributes.name },
+            });
+          }
+          // Extract and set modId from source URL if not already set
+          if (!m.attributes?.modId && typeof src === 'string') {
+            const match = src.match(/\/files\/file\/(\d+)/);
+            if (match) {
+              context.api.store.dispatch({
+                type: 'SET_MOD_ATTRIBUTE',
+                payload: { gameId, modId: m.id, attribute: 'modId', value: `ll_${match[1]}` },
+              });
+            }
+          }
         }
       });
 
@@ -402,15 +414,24 @@ function showSetSourceDialog(api, modId) {
           ? getDialogValue(result, 'version')
           : '';
 
+        const urlString = parsedUrl.toString();
         api.store.dispatch({
           type: 'SET_MOD_ATTRIBUTE',
-          payload: { gameId, modId, attribute: 'source', value: parsedUrl.toString() },
+          payload: { gameId, modId, attribute: 'source', value: urlString },
         });
         // Set logicalFileName for version dropdown grouping
         api.store.dispatch({
           type: 'SET_MOD_ATTRIBUTE',
           payload: { gameId, modId, attribute: 'logicalFileName', value: mod.attributes?.name || modId },
         });
+        // Extract and set modId from URL for modId-based grouping
+        const match = urlString.match(/\/files\/file\/(\d+)/);
+        if (match) {
+          api.store.dispatch({
+            type: 'SET_MOD_ATTRIBUTE',
+            payload: { gameId, modId, attribute: 'modId', value: `ll_${match[1]}` },
+          });
+        }
         if (inputVersion.trim()) {
           api.store.dispatch({
             type: 'SET_MOD_ATTRIBUTE',

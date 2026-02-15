@@ -174,17 +174,43 @@ async function copyDirRecursive(src, dest) {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /**
- * Tag a Vortex download entry with LoversLab-related metadata.
+ * Extract LoversLab file/page ID from URL for use as modId.
+ * Vortex groups mods by modId first, then by logicalFileName.
+ * This ensures all versions of the same LL mod share a unique identifier.
  */
-function setDownloadMeta(api, dlId, modName, version) {
+function extractLoversLabModId(sourceUrl) {
+  if (!sourceUrl || typeof sourceUrl !== 'string') return null;
+  try {
+    // Match patterns like: /files/file/12345-mod-name/ or /files/file/12345/
+    const match = sourceUrl.match(/\/files\/file\/(\d+)/);
+    return match ? `ll_${match[1]}` : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Tag a Vortex download entry with LoversLab-related metadata.
+ * CRITICAL: logicalFileName must be set in download metadata (not just mod attributes)
+ * so Vortex's attributeExtractor picks it up during installation.
+ */
+function setDownloadMeta(api, dlId, modName, version, sourceUrl) {
   try {
     if (modName) {
       api.store.dispatch({ type: 'SET_DOWNLOAD_MODINFO', payload: { id: dlId, key: 'name', value: modName } });
+      // Set logicalFileName in download metadata so attributeExtractor uses it during install
+      api.store.dispatch({ type: 'SET_DOWNLOAD_MODINFO', payload: { id: dlId, key: 'meta', value: { logicalFileName: modName } } });
     }
     if (version) {
       api.store.dispatch({ type: 'SET_DOWNLOAD_MODINFO', payload: { id: dlId, key: 'version', value: version } });
     }
+    // Set modId from LL URL for modId-based grouping
+    const llModId = extractLoversLabModId(sourceUrl);
+    if (llModId) {
+      api.store.dispatch({ type: 'SET_DOWNLOAD_MODINFO', payload: { id: dlId, key: 'ids', value: { modId: llModId } } });
+    }
     api.store.dispatch({ type: 'SET_DOWNLOAD_MODINFO', payload: { id: dlId, key: 'source', value: 'loverslab' } });
+    debugLog('Set download metadata', { dlId, modName, version, llModId });
   } catch (err) {
     debugLog('Could not set download metadata (non-critical)', { error: err.message });
   }
@@ -192,32 +218,45 @@ function setDownloadMeta(api, dlId, modName, version) {
 
 /**
  * Set mod attributes required for Vortex's native version dropdown grouping.
- *
- * Vortex groups mods via modGrouping.ts → byFile → fileMatch, which compares
- * logicalFileName (with version stripped out). Setting the same logicalFileName
- * on all versions of a LoversLab mod ensures they appear together in the
- * version dropdown, enabling one-click switching between versions.
+ * This is a backup/enhancement to ensure attributes are correct even if
+ * Vortex's attributeExtractor didn't pick them up from download metadata.
  */
-function applyVersionGrouping(api, installedModId, modName, version) {
+function applyVersionGrouping(api, installedModId, modName, version, sourceUrl) {
   if (!installedModId) return;
   try {
-    if (modName) {
+    const state = api.getState();
+    const mods = util.getSafe(state, ['persistent', 'mods', GAME_ID], {});
+    const mod = mods[installedModId];
+    const needsLogicalFileName = modName && (!mod?.attributes?.logicalFileName || mod.attributes.logicalFileName !== modName);
+    const needsVersion = version && (!mod?.attributes?.version || mod.attributes.version !== version);
+    const llModId = extractLoversLabModId(sourceUrl);
+    const needsModId = llModId && (!mod?.attributes?.modId || mod.attributes.modId !== llModId);
+
+    if (needsLogicalFileName) {
       api.store.dispatch({
         type: 'SET_MOD_ATTRIBUTE',
         payload: { gameId: GAME_ID, modId: installedModId, attribute: 'logicalFileName', value: modName },
       });
     }
-    if (version) {
+    if (needsVersion) {
       api.store.dispatch({
         type: 'SET_MOD_ATTRIBUTE',
         payload: { gameId: GAME_ID, modId: installedModId, attribute: 'version', value: version },
       });
     }
-    api.store.dispatch({
-      type: 'SET_MOD_ATTRIBUTE',
-      payload: { gameId: GAME_ID, modId: installedModId, attribute: 'source', value: 'loverslab' },
-    });
-    debugLog('Applied version grouping attributes', { installedModId, modName, version });
+    if (needsModId) {
+      api.store.dispatch({
+        type: 'SET_MOD_ATTRIBUTE',
+        payload: { gameId: GAME_ID, modId: installedModId, attribute: 'modId', value: llModId },
+      });
+    }
+    if (!mod?.attributes?.source || mod.attributes.source !== 'loverslab') {
+      api.store.dispatch({
+        type: 'SET_MOD_ATTRIBUTE',
+        payload: { gameId: GAME_ID, modId: installedModId, attribute: 'source', value: 'loverslab' },
+      });
+    }
+    debugLog('Applied version grouping attributes', { installedModId, modName, version, llModId, needsLogicalFileName, needsVersion, needsModId });
   } catch (err) {
     debugLog('Failed to apply version grouping (non-critical)', { error: err.message });
   }
@@ -256,14 +295,14 @@ async function installFile(api, filePath, modName, version) {
         return reject(new Error('Vortex did not return a download ID'));
       }
       const dlId = dlIds[0];
-      setDownloadMeta(api, dlId, modName, version);
+      setDownloadMeta(api, dlId, modName, version, null);
 
       api.events.emit('start-install-download', dlId, true, (err, installedModId) => {
         if (err) {
           errorLog('installFile: install step failed', { dlId, error: err.message });
           return reject(err);
         }
-        applyVersionGrouping(api, installedModId, modName, version);
+        applyVersionGrouping(api, installedModId, modName, version, null);
         resolve(installedModId || dlId);
       });
     });
@@ -297,8 +336,10 @@ async function installLocalFileUpdate(api, mod, filePath, latestVersion) {
       const dlId = dlIds[0];
       debugLog('File imported to Vortex downloads', { dlId, filePath });
 
-      // Step 2: Tag the download with mod metadata
-      setDownloadMeta(api, dlId, modName, latestVersion || previousVersion);
+      // Step 2: Tag the download with mod metadata INCLUDING logicalFileName
+      // so Vortex's attributeExtractor picks it up during installation
+      const sourceUrl = mod.attributes?.source || null;
+      setDownloadMeta(api, dlId, modName, latestVersion || previousVersion, sourceUrl);
 
       // Step 3: Trigger Vortex's native mod installation
       api.events.emit('start-install-download', dlId, true, (err, installedModId) => {
@@ -314,19 +355,12 @@ async function installLocalFileUpdate(api, mod, filePath, latestVersion) {
           latestVersion,
         });
 
-        // Apply version grouping to the newly installed mod so it appears
-        // in the same version dropdown as the existing version
-        applyVersionGrouping(api, installedModId, modName, latestVersion || previousVersion);
+        // Apply version grouping attributes (backup/enhancement)
+        applyVersionGrouping(api, installedModId, modName, latestVersion || previousVersion, sourceUrl);
 
-        // Ensure the existing (old) mod also has logicalFileName so the
-        // grouping engine (modGrouping.ts → byFile) links them together
+        // Ensure the existing (old) mod also has grouping attributes
         if (modId && modId !== installedModId) {
-          try {
-            api.store.dispatch({
-              type: 'SET_MOD_ATTRIBUTE',
-              payload: { gameId: GAME_ID, modId, attribute: 'logicalFileName', value: modName },
-            });
-          } catch (_e) { /* non-critical */ }
+          applyVersionGrouping(api, modId, modName, previousVersion, sourceUrl);
         }
 
         // Record previous version in mod attributes so the extension can
@@ -394,7 +428,17 @@ async function installAlreadyDownloaded(api, filePath, modName, latestVersion, k
     }
   }
 
-  setDownloadMeta(api, dlId, modName, latestVersion);
+  // Get source URL from existing mod for modId extraction
+  let sourceUrl = null;
+  if (knownModId) {
+    try {
+      const state = api.getState();
+      const mods = util.getSafe(state, ['persistent', 'mods', GAME_ID], {});
+      sourceUrl = mods[knownModId]?.attributes?.source || null;
+    } catch (_e) { /* non-critical */ }
+  }
+
+  setDownloadMeta(api, dlId, modName, latestVersion, sourceUrl);
 
   return new Promise((resolve, reject) => {
     api.events.emit('start-install-download', dlId, true, (err, installedModId) => {
@@ -405,17 +449,12 @@ async function installAlreadyDownloaded(api, filePath, modName, latestVersion, k
 
       infoLog('Downloaded file installed via Vortex', { installedModId, modName, latestVersion });
 
-      // Apply version grouping attributes for the version dropdown
-      applyVersionGrouping(api, installedModId, modName, latestVersion);
+      // Apply version grouping attributes
+      applyVersionGrouping(api, installedModId, modName, latestVersion, sourceUrl);
 
-      // Ensure the existing mod also has logicalFileName for grouping
+      // Ensure the existing mod also has grouping attributes
       if (knownModId && knownModId !== installedModId) {
-        try {
-          api.store.dispatch({
-            type: 'SET_MOD_ATTRIBUTE',
-            payload: { gameId: GAME_ID, modId: knownModId, attribute: 'logicalFileName', value: modName },
-          });
-        } catch (_e) { /* non-critical */ }
+        applyVersionGrouping(api, knownModId, modName, null, sourceUrl);
       }
 
       // Attempt to attach previous version metadata to the installed mod
