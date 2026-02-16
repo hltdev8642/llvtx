@@ -73,6 +73,37 @@ function main(context) {
     },
   });
 
+  // ── Attribute Extractor for LoversLab Downloads ────────────────────────
+
+  // Register at priority 200 (after Vortex's default at 100) so our values
+  // take precedence for LL downloads. This ensures modId and logicalFileName
+  // are correctly set during mod installation from download metadata.
+  context.registerAttributeExtractor(200, (input) => {
+    const source = input?.download?.modInfo?.source;
+    if (source !== 'loverslab') return Promise.resolve({});
+
+    const result = {};
+
+    // modId drives byModId grouping in modGrouping.ts
+    const modId = input?.download?.modInfo?.ids?.modId;
+    if (modId) result.modId = modId;
+
+    // logicalFileName drives byFile grouping via fileMatch()/logicalName()
+    // Check both meta.logicalFileName (our primary) and download.modInfo.meta
+    const logicalFileName = input?.meta?.logicalFileName
+      || input?.download?.modInfo?.meta?.logicalFileName;
+    if (logicalFileName) result.logicalFileName = logicalFileName;
+
+    // version is needed for logicalName() to strip from logicalFileName
+    const version = input?.download?.modInfo?.version;
+    if (version) result.version = version;
+
+    result.source = 'loverslab';
+
+    debugLog('LL attributeExtractor fired', { modId, logicalFileName, version });
+    return Promise.resolve(result);
+  });
+
   // ── Toolbar Actions ────────────────────────────────────────────────────
 
   // Check for updates button
@@ -164,30 +195,39 @@ function main(context) {
       if (gameId !== GAME_ID) return;
       const state = context.api.getState();
 
-      // Ensure all LL-tagged mods have logicalFileName and modId set for version
-      // dropdown grouping. Vortex groups by modId first, then by logicalFileName.
+      // Set modId and logicalFileName on all LL mods for version dropdown grouping.
+      // Uses LL file ID from URL as the STABLE identifier — not mod names, which
+      // vary between versions and break Vortex's fileMatch() comparison.
+      // Grouping pipeline: byModId (attributes.modId) → byFile (logicalFileName) → byEnabled
       const allMods = util.getSafe(state, ['persistent', 'mods', gameId], {});
       Object.values(allMods).forEach((m) => {
         const src = m.attributes?.source || '';
-        if (src.includes(LOVERSLAB_DOMAIN)) {
-          // Set NORMALIZED logicalFileName for consistent grouping
-          if (!m.attributes?.logicalFileName && m.attributes?.name) {
-            const normalizedName = normalizeModName(m.attributes.name);
+        if (!src.includes(LOVERSLAB_DOMAIN)) return;
+
+        const match = src.match(/\/files\/file\/(\d+)/);
+        if (match) {
+          // Have LL file ID — use for stable grouping across all versions
+          const llModId = `ll_${match[1]}`;
+
+          if (m.attributes?.modId !== llModId) {
             context.api.store.dispatch({
               type: 'SET_MOD_ATTRIBUTE',
-              payload: { gameId, modId: m.id, attribute: 'logicalFileName', value: normalizedName },
+              payload: { gameId, modId: m.id, attribute: 'modId', value: llModId },
             });
           }
-          // Extract and set modId from source URL if not already set
-          if (!m.attributes?.modId && typeof src === 'string') {
-            const match = src.match(/\/files\/file\/(\d+)/);
-            if (match) {
-              context.api.store.dispatch({
-                type: 'SET_MOD_ATTRIBUTE',
-                payload: { gameId, modId: m.id, attribute: 'modId', value: `ll_${match[1]}` },
-              });
-            }
+          // Preserve user-visible logicalFileName; only set it if missing.
+          if (!m.attributes?.logicalFileName && m.attributes?.name) {
+            context.api.store.dispatch({
+              type: 'SET_MOD_ATTRIBUTE',
+              payload: { gameId, modId: m.id, attribute: 'logicalFileName', value: normalizeModName(m.attributes.name) },
+            });
           }
+        } else if (!m.attributes?.logicalFileName && m.attributes?.name) {
+          // No LL file ID — use normalized name as fallback (only if not already set)
+          context.api.store.dispatch({
+            type: 'SET_MOD_ATTRIBUTE',
+            payload: { gameId, modId: m.id, attribute: 'logicalFileName', value: normalizeModName(m.attributes.name) },
+          });
         }
       });
 
@@ -422,15 +462,18 @@ function showSetSourceDialog(api, modId) {
           type: 'SET_MOD_ATTRIBUTE',
           payload: { gameId, modId, attribute: 'source', value: urlString },
         });
-        // Set NORMALIZED logicalFileName for version dropdown grouping
-        const modName = mod.attributes?.name || modId;
-        const normalizedName = normalizeModName(modName);
-        api.store.dispatch({
-          type: 'SET_MOD_ATTRIBUTE',
-          payload: { gameId, modId, attribute: 'logicalFileName', value: normalizedName },
-        });
-        // Extract and set modId from URL for modId-based grouping
+        // Set logicalFileName and modId from LL file ID for version dropdown grouping
+        // Uses file page ID (stable across versions) instead of mod name (which varies)
         const match = urlString.match(/\/files\/file\/(\d+)/);
+        const llFileNum = match ? match[1] : null;
+        // Do not overwrite the user-visible logicalFileName with an ll_id.
+        // Only set logicalFileName if it's missing so the display name remains intact.
+        if (!mod.attributes?.logicalFileName && mod.attributes?.name) {
+          api.store.dispatch({
+            type: 'SET_MOD_ATTRIBUTE',
+            payload: { gameId, modId, attribute: 'logicalFileName', value: normalizeModName(mod.attributes.name) },
+          });
+        }
         if (match) {
           api.store.dispatch({
             type: 'SET_MOD_ATTRIBUTE',
